@@ -1,3 +1,5 @@
+import "./globals.css";
+
 export const metadata = {
   title: "IG Profile HD — Download Instagram Profile Pictures",
   description: "Download Instagram profile pictures in full resolution. Simple, fast, free.",
