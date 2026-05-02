@@ -9,130 +9,121 @@ function getSessionCookie(): string | undefined {
   try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
-function buildCookieHeader(): string | undefined {
+/** Build a cookie header. Includes sessionid if configured, plus the
+ *  minimal anonymous cookies that Instagram expects (same as Instaloader). */
+function buildCookieHeader(): string {
   const session = getSessionCookie();
-  if (!session) return undefined;
-  return `sessionid=${session}`;
+  const cookies: string[] = [
+    "ig_pr=1",
+    "ig_vw=1920",
+  ];
+  if (session) {
+    cookies.push(`sessionid=${session}`);
+    cookies.push(`ds_user_id=0`);
+  } else {
+    cookies.push("sessionid=");
+    cookies.push("mid=");
+    cookies.push("csrftoken=");
+    cookies.push("ds_user_id=");
+    cookies.push("s_network=");
+  }
+  return cookies.join("; ");
+}
+
+/** Default HTTP headers modeled after Instaloader */
+function buildDefaultHeaders(): Record<string, string> {
+  return {
+    "Accept-Encoding": "gzip, deflate",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Connection": "keep-alive",
+    "Host": "www.instagram.com",
+    "Origin": "https://www.instagram.com",
+    "Referer": "https://www.instagram.com/",
+    "User-Agent": USER_AGENT,
+  };
+}
+
+/** Headers for GraphQL queries (no Connection/Content-Length) */
+function buildGraphqlHeaders(referer?: string): Record<string, string> {
+  const h = buildDefaultHeaders();
+  delete h["Connection"];
+  delete h["Host"];
+  delete h["Origin"];
+  h["authority"] = "www.instagram.com";
+  h["scheme"] = "https";
+  h["accept"] = "*/*";
+  if (referer) {
+    h["referer"] = referer;
+  }
+  h["cookie"] = buildCookieHeader();
+  return h;
 }
 
 /* ------------------------------------------------------------------ */
-/*  STRATEGY 1: Scrape the normal HTML profile page                   */
-/*  Instagram embeds user data as JSON inside <script> tags           */
+/*  Doc ID GraphQL Query (POST, modeled after Instaloader)            */
 /* ------------------------------------------------------------------ */
 
-async function scrapeProfilePage(username: string) {
-  const url = `https://www.instagram.com/${encodeURIComponent(username)}/`;
+async function docIdGraphqlQuery(docId: string, variables: Record<string, unknown>): Promise<any> {
+  const url = "https://www.instagram.com/graphql/query";
+  const headers = buildGraphqlHeaders("https://www.instagram.com/");
 
-  const headers: Record<string, string> = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "max-age=0",
-    "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="134", "Google Chrome";v="134"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-    "user-agent": USER_AGENT,
-  };
-
-  const cookie = buildCookieHeader();
-  if (cookie) headers["cookie"] = cookie;
+  const body = new URLSearchParams();
+  body.set("variables", JSON.stringify(variables));
+  body.set("doc_id", docId);
+  body.set("server_timestamps", "true");
 
   try {
-    const res = await fetch(url, { headers, redirect: "manual" });
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: body.toString(),
+      redirect: "manual",
+    });
 
     if (res.status >= 300 && res.status < 400) {
-      console.error(`HTML scrape redirect ${res.status} -> ${res.headers.get("location")}`);
+      console.error(`GraphQL redirect ${res.status} -> ${res.headers.get("location")}`);
       return null;
     }
     if (!res.ok) {
-      console.error(`HTML scrape HTTP ${res.status}`);
+      const text = await res.text().catch(() => "");
+      console.error(`GraphQL error ${res.status}: ${text.slice(0, 200)}`);
       return null;
     }
-
-    const html = await res.text();
-
-    // Strategy 1a: Look for window._sharedData (older Instagram)
-    const sharedMatch = html.match(/window\._sharedData\s*=\s*({.+?});<\/script>/);
-    if (sharedMatch) {
-      const data = JSON.parse(sharedMatch[1]);
-      const user = data?.entry_data?.ProfilePage?.[0]?.graphql?.user;
-      if (user) return normalizeUser(user);
-    }
-
-    // Strategy 1b: Look for <script type="application/json" data-sjs>
-    // Instagram injects multiple JSON blobs; one contains the user object
-    {
-      const re = /<script type="application\/json"[^>]*>(.+?)<\/script>/g;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(html)) !== null) {
-        try {
-          const blob = JSON.parse(m[1]);
-          const raw = extractUserFromBlob(blob);
-          if (raw) return normalizeUser(raw as Record<string, unknown>);
-        } catch { /* ignore malformed JSON */ }
-      }
-    }
-
-    // Strategy 1c: Look for raw "profile_pic_url_hd" in any script block
-    {
-      const re = /<script[^>]*>([\s\S]*?)<\/script>/g;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(html)) !== null) {
-        const script = m[1];
-        if (script.includes('"profile_pic_url"') || script.includes('"username"')) {
-          try {
-            const objMatch = script.match(/{"biography"[\s\S]*?"username":"[^"]+"[\s\S]*?}/);
-            if (objMatch) {
-              const obj = JSON.parse(objMatch[0]);
-              if (obj.username) return normalizeUser(obj as Record<string, unknown>);
-            }
-          } catch { /* ignore */ }
-        }
-      }
-    }
-
-    console.error("Could not extract user data from HTML");
-    return null;
+    return res.json();
   } catch (err) {
-    console.error("scrapeProfilePage error:", err);
+    console.error("docIdGraphqlQuery error:", err);
     return null;
   }
 }
 
-/** Instagram wraps data in Relay-style objects. Drill down to find user. */
-function extractUserFromBlob(blob: unknown): unknown {
-  if (!blob || typeof blob !== "object") return null;
+/* ------------------------------------------------------------------ */
+/*  Profile fetch via search Doc ID (Instaloader approach)            */
+/* ------------------------------------------------------------------ */
 
-  // Direct user object
-  if ("username" in (blob as Record<string, unknown>) && "profile_pic_url" in (blob as Record<string, unknown>)) {
-    return blob;
-  }
+async function fetchProfileBySearch(username: string) {
+  const data = await docIdGraphqlQuery("26347858941511777", {
+    hasQuery: true,
+    query: username,
+  });
 
-  // Instagram wraps data under require() payloads
-  const obj = blob as Record<string, unknown>;
+  if (!data?.data) return null;
 
-  // Look for "user" key anywhere
-  if (obj.user && typeof obj.user === "object" && "username" in (obj.user as Record<string, unknown>)) {
-    return obj.user;
-  }
+  const users = data.data.xdt_api__v1__fbsearch__non_profiled_serp?.users;
+  if (!Array.isArray(users)) return null;
 
-  // Look in common Instagram wrapper keys
-  for (const key of ["data", "result", "rootView", "props", "page", "entry_data", "graphql"]) {
-    if (obj[key] && typeof obj[key] === "object") {
-      const nested = extractUserFromBlob(obj[key]);
-      if (nested) return nested;
+  for (const user of users) {
+    if (user.username?.toLowerCase() === username.toLowerCase()) {
+      return normalizeUser(user);
     }
   }
-
   return null;
 }
 
 /* ------------------------------------------------------------------ */
-/*  STRATEGY 2: Fallback to the API endpoint                          */
+/*  Fallback: web_profile_info API endpoint                           */
 /* ------------------------------------------------------------------ */
 
 async function fetchWebProfileInfo(username: string) {
@@ -141,13 +132,9 @@ async function fetchWebProfileInfo(username: string) {
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
     "referer": `https://www.instagram.com/${encodeURIComponent(username)}/`,
-    "sec-ch-prefers-color-scheme": "dark",
     "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="134", "Google Chrome";v="134"',
-    "sec-ch-ua-full-version-list": '"Not.A/Brand";v="8.0.0.0", "Chromium";v="134.0.6998.118", "Google Chrome";v="134.0.6998.118"',
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
     "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"19.0.0"',
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
@@ -155,10 +142,8 @@ async function fetchWebProfileInfo(username: string) {
     "x-asbd-id": "129477",
     "x-ig-app-id": "936619743392459",
     "x-requested-with": "XMLHttpRequest",
+    "cookie": buildCookieHeader(),
   };
-
-  const cookie = buildCookieHeader();
-  if (cookie) headers["cookie"] = cookie;
 
   try {
     const res = await fetch(url, { headers, redirect: "manual" });
@@ -205,10 +190,9 @@ function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
   const edgeFollow = (raw.edge_follow as Record<string, unknown>)?.count;
   const edgeMedia = (raw.edge_owner_to_timeline_media as Record<string, unknown>)?.count;
 
-  const hd =
-    (raw.hd_profile_pic_url_info as Record<string, unknown>)?.url ||
-    raw.profile_pic_url_hd ||
-    raw.profile_pic_url;
+  // Try hd_profile_pic_url_info first (highest res when logged in)
+  const hdInfo = (raw.hd_profile_pic_url_info as Record<string, unknown>)?.url;
+  const hdFallback = raw.profile_pic_url_hd || raw.profile_pic_url;
 
   return {
     username,
@@ -218,7 +202,7 @@ function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
     following: getNum(edgeFollow ?? raw.following_count),
     posts: getNum(edgeMedia ?? raw.media_count),
     profile_pic_url: String(raw.profile_pic_url || ""),
-    hd_profile_pic_url: String(hd || raw.profile_pic_url || ""),
+    hd_profile_pic_url: String(hdInfo || hdFallback || raw.profile_pic_url || ""),
     is_private: Boolean(raw.is_private),
     is_verified: Boolean(raw.is_verified),
   };
@@ -257,35 +241,35 @@ export async function GET(request: Request) {
   const hasSession = !!getSessionCookie();
 
   try {
-    // Strategy 1: HTML scrape (looks like normal browser visit)
-    const scraped = await scrapeProfilePage(username);
-    if (scraped) {
+    // Strategy 1: Doc ID GraphQL search (Instaloader approach)
+    const user = await fetchProfileBySearch(username);
+    if (user) {
       return Response.json({
-        ...scraped,
-        profile_pic_url: cleanUrl(scraped.profile_pic_url),
-        hd_profile_pic_url: cleanUrl(scraped.hd_profile_pic_url),
+        ...user,
+        profile_pic_url: cleanUrl(user.profile_pic_url),
+        hd_profile_pic_url: cleanUrl(user.hd_profile_pic_url),
         has_session: hasSession,
-        source: "html_scrape",
+        source: "doc_id_search",
       });
     }
 
-    // Strategy 2: API fallback
-    const api = await fetchWebProfileInfo(username);
-    if (api?.data?.user) {
-      const user = normalizeUser(api.data.user as Record<string, unknown>);
-      if (user) {
+    // Strategy 2: web_profile_info API fallback
+    const info = await fetchWebProfileInfo(username);
+    if (info?.data?.user) {
+      const u = normalizeUser(info.data.user as Record<string, unknown>);
+      if (u) {
         return Response.json({
-          ...user,
-          profile_pic_url: cleanUrl(user.profile_pic_url),
-          hd_profile_pic_url: cleanUrl(user.hd_profile_pic_url),
+          ...u,
+          profile_pic_url: cleanUrl(u.profile_pic_url),
+          hd_profile_pic_url: cleanUrl(u.hd_profile_pic_url),
           has_session: hasSession,
-          source: "api",
+          source: "web_profile_info",
         });
       }
     }
 
-    if (api?.message) {
-      console.error("Instagram API message:", api.message);
+    if (info?.message) {
+      console.error("Instagram API message:", info.message);
     }
 
     return Response.json(
