@@ -208,10 +208,14 @@ function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
   };
 }
 
-/** Strip Instagram CDN size parameters */
+/** Strip Instagram CDN size parameters, especially the stp=dst-jpg_s... param
+ *  that forces a low-res thumbnail. */
 function cleanUrl(url: string): string {
   try {
     const u = new URL(url);
+    // Remove the 'stp' param entirely — it forces a specific size like s320x320
+    u.searchParams.delete("stp");
+    // Also remove explicit size params
     u.searchParams.delete("s");
     u.searchParams.delete("w");
     u.searchParams.delete("h");
