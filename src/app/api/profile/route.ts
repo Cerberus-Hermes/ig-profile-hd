@@ -31,11 +31,29 @@ async function scrapeWithPuppeteer(username: string) {
     await page.setUserAgent(USER_AGENT);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Block unnecessary resources to speed up loading
+    // Inject Instagram cookies if available
+    const sessionId = process.env.INSTAGRAM_SESSION_ID?.trim();
+    if (sessionId) {
+      const cookies = [
+        {
+          name: "sessionid",
+          value: sessionId,
+          domain: ".instagram.com",
+          path: "/",
+          httpOnly: true,
+          secure: true,
+          sameSite: "Lax" as const,
+        },
+      ];
+      await page.setCookie(...cookies);
+      console.log("Injected Instagram session cookie into Puppeteer");
+    }
+
+    // Block only non-essential resources; keep images so src/srcset populate
     await page.setRequestInterception(true);
     page.on("request", (req: any) => {
       const resourceType = req.resourceType();
-      if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
+      if (["stylesheet", "font", "media"].includes(resourceType)) {
         req.abort();
       } else {
         req.continue();
@@ -96,7 +114,13 @@ async function scrapeWithPuppeteer(username: string) {
         }
       }
 
-      // 2. Extract username
+      // 2. Extract og:image (often higher resolution)
+      const ogImage = document.querySelector('meta[property="og:image"]') as HTMLMetaElement | null;
+      if (ogImage?.content) {
+        data.og_image = ogImage.content;
+      }
+
+      // 3. Extract username
       const titleMatch = document.title.match(/@?([a-zA-Z0-9._]+)/);
       data.username = titleMatch?.[1] || "";
 
@@ -152,9 +176,14 @@ async function scrapeWithPuppeteer(username: string) {
     browser = null;
 
     // Validate
-    if (!result.hd_profile_pic_url) {
+    if (!result.hd_profile_pic_url && !result.og_image) {
       return null;
     }
+
+    // Prefer og:image if it looks higher-res (no s320x320 in URL)
+    const ogUrl = result.og_image || "";
+    const hdUrl = result.hd_profile_pic_url || "";
+    const finalHd = (!ogUrl.includes("320x320") && ogUrl.includes("cdninstagram")) ? ogUrl : hdUrl;
 
     return {
       username: result.username || username,
@@ -163,8 +192,8 @@ async function scrapeWithPuppeteer(username: string) {
       followers: 0,
       following: 0,
       posts: 0,
-      profile_pic_url: result.profile_pic_url || result.hd_profile_pic_url,
-      hd_profile_pic_url: result.hd_profile_pic_url,
+      profile_pic_url: result.profile_pic_url || finalHd,
+      hd_profile_pic_url: finalHd,
       is_private: false,
       is_verified: false,
       source: "puppeteer",
