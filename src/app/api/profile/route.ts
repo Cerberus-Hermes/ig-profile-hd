@@ -3,51 +3,70 @@ export const dynamic = "force-dynamic";
 const IG_APP_ID = "936619743392459";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
-/** Instagram fügt oft ?s=150x150 oder ?s=320x320 zu Profilbildern hinzu.
- *  Wir entfernen/überschreiben das, um die volle Auflösung zu bekommen. */
-function maxResolutionInstagramUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    // Entferne Größen-parameter
-    u.searchParams.delete("s");
-    u.searchParams.delete("w");
-    u.searchParams.delete("h");
-    u.searchParams.delete("c");
-    // Füge einen sehr hohen s-Wert hinzu, damit Instagram das Original liefert
-    u.searchParams.set("s", "1080x1080");
-    return u.toString();
-  } catch {
-    return url;
+/** Extract the session cookie from the environment */
+function getSessionCookie(): string | undefined {
+  return process.env.INSTAGRAM_SESSION_ID;
+}
+
+/** Build request headers. Includes session cookie if configured. */
+function buildHeaders(username: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "x-ig-app-id": IG_APP_ID,
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Referer": `https://www.instagram.com/${encodeURIComponent(username)}/`,
+  };
+  const session = getSessionCookie();
+  if (session) {
+    headers["Cookie"] = `sessionid=${session}`;
   }
+  return headers;
 }
 
 async function fetchWebProfileInfo(username: string) {
   const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
   const res = await fetch(url, {
-    headers: {
-      "x-ig-app-id": IG_APP_ID,
-      "User-Agent": USER_AGENT,
-      "Accept": "*/*",
-      "Referer": `https://www.instagram.com/${encodeURIComponent(username)}/`,
-    },
+    headers: buildHeaders(username),
     next: { revalidate: 0 },
-  });
+  } as RequestInit);
   if (!res.ok) return null;
   return res.json();
 }
 
 async function fetchGraphQL(username: string) {
   const url = `https://www.instagram.com/${encodeURIComponent(username)}/?__a=1&__d=dis`;
+  const headers: Record<string, string> = {
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Referer": "https://www.instagram.com/",
+  };
+  const session = getSessionCookie();
+  if (session) {
+    headers["Cookie"] = `sessionid=${session}`;
+  }
   const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept": "*/*",
-      "Referer": "https://www.instagram.com/",
-    },
+    headers,
     next: { revalidate: 0 },
-  });
+  } as RequestInit);
   if (!res.ok) return null;
   return res.json();
+}
+
+/** When logged in, Instagram already serves the full-res URL.
+ *  When anonymous, the URL may contain size params like s320x320.
+ *  We strip them so the browser gets the largest available version.
+ */
+function cleanInstagramUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.searchParams.delete("s");
+    u.searchParams.delete("w");
+    u.searchParams.delete("h");
+    u.searchParams.delete("c");
+    return u.toString();
+  } catch {
+    return url;
+  }
 }
 
 export async function GET(request: Request) {
@@ -62,15 +81,22 @@ export async function GET(request: Request) {
     return Response.json({ error: "Invalid username format" }, { status: 400 });
   }
 
+  const hasSession = !!getSessionCookie();
+
   try {
     // Try web_profile_info first (most reliable for HD)
     const info = await fetchWebProfileInfo(username);
     if (info?.data?.user) {
       const user = info.data.user;
-      const hdUrl = maxResolutionInstagramUrl(
-        user.hd_profile_pic_url_info?.url || user.profile_pic_url
-      );
-      const thumbUrl = maxResolutionInstagramUrl(user.profile_pic_url);
+
+      // With session: hd_profile_pic_url_info contains true original resolution
+      // Without session: it may be absent or low-res; fallback to profile_pic_url_hd
+      const hdRaw = user.hd_profile_pic_url_info?.url || user.profile_pic_url_hd || user.profile_pic_url;
+      const thumbRaw = user.profile_pic_url;
+
+      const hdUrl = cleanInstagramUrl(hdRaw);
+      const thumbUrl = cleanInstagramUrl(thumbRaw);
+
       return Response.json({
         username: user.username,
         full_name: user.full_name,
@@ -82,6 +108,7 @@ export async function GET(request: Request) {
         hd_profile_pic_url: hdUrl,
         is_private: user.is_private,
         is_verified: user.is_verified,
+        has_session: hasSession,
       });
     }
 
@@ -89,8 +116,8 @@ export async function GET(request: Request) {
     const gql = await fetchGraphQL(username);
     if (gql?.graphql?.user) {
       const user = gql.graphql.user;
-      const hdUrl = maxResolutionInstagramUrl(user.profile_pic_url_hd || user.profile_pic_url);
-      const thumbUrl = maxResolutionInstagramUrl(user.profile_pic_url);
+      const hdUrl = cleanInstagramUrl(user.profile_pic_url_hd || user.profile_pic_url);
+      const thumbUrl = cleanInstagramUrl(user.profile_pic_url);
       return Response.json({
         username: user.username,
         full_name: user.full_name,
@@ -102,10 +129,14 @@ export async function GET(request: Request) {
         hd_profile_pic_url: hdUrl,
         is_private: user.is_private,
         is_verified: user.is_verified,
+        has_session: hasSession,
       });
     }
 
-    return Response.json({ error: "Profile not found or rate limited by Instagram" }, { status: 404 });
+    return Response.json(
+      { error: "Profile not found or rate limited by Instagram" },
+      { status: 404 }
+    );
   } catch (err) {
     console.error("Profile fetch error:", err);
     return Response.json({ error: "Failed to fetch profile" }, { status: 500 });

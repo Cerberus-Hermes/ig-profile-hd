@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef } from "react";
-import { Search, Download, Loader2, ZoomIn, User, ImageOff } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import { Search, Download, Loader2, ZoomIn, User, ImageOff, Info } from "lucide-react";
 
 interface ProfileData {
   username: string;
@@ -14,6 +14,7 @@ interface ProfileData {
   hd_profile_pic_url: string;
   is_private: boolean;
   is_verified: boolean;
+  has_session?: boolean;
 }
 
 export default function Home() {
@@ -22,7 +23,15 @@ export default function Home() {
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [error, setError] = useState("");
   const [zoom, setZoom] = useState(false);
+  const [hasSession, setHasSession] = useState<boolean | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    fetch("/api/session")
+      .then((r) => r.json())
+      .then((d) => setHasSession(d.has_session))
+      .catch(() => setHasSession(false));
+  }, []);
 
   async function handleSearch(e?: React.FormEvent) {
     e?.preventDefault();
@@ -57,7 +66,6 @@ export default function Home() {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
     } catch {
-      // fallback: open in new tab
       window.open(profile.hd_profile_pic_url, "_blank");
     }
   }
@@ -74,9 +82,30 @@ export default function Home() {
         <h1 className="text-3xl font-bold text-center mb-2 tracking-tight">
           IG Profile <span className="text-primary">HD</span>
         </h1>
-        <p className="text-center text-muted-foreground text-sm mb-10">
+        <p className="text-center text-muted-foreground text-sm mb-6">
           Download Instagram profile pictures in full resolution
         </p>
+
+        {/* Session status badge */}
+        {hasSession === false && (
+          <div className="mb-6 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 flex gap-2.5 items-start">
+            <Info className="h-4 w-4 text-yellow-500 shrink-0 mt-0.5" />
+            <div className="text-xs text-yellow-200/80 leading-relaxed">
+              <strong className="text-yellow-200">No session cookie configured.</strong>
+              <br />
+              Images are limited to ~320×320. Add{" "}
+              <code className="bg-black/30 px-1 py-0.5 rounded text-yellow-100 font-mono text-[10px]">
+                INSTAGRAM_SESSION_ID
+              </code>{" "}
+              to your environment variables for true HD (1080×1080).
+            </div>
+          </div>
+        )}
+        {hasSession === true && (
+          <div className="mb-6 rounded-xl border border-green-500/30 bg-green-500/10 p-2 text-center text-[11px] text-green-300 font-medium">
+            ✓ Session cookie active — fetching true HD resolution
+          </div>
+        )}
 
         <form onSubmit={handleSearch} className="relative mb-8">
           <input
