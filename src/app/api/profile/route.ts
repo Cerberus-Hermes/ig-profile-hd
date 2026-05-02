@@ -1,33 +1,48 @@
 export const dynamic = "force-dynamic";
 
 const IG_APP_ID = "936619743392459";
+const ASBD_ID = "129477";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
-/** Extract and decode the session cookie from the environment.
- *  DevTools shows cookies URL-encoded (%3A for :), so we decode first. */
+/** Extract and decode the session cookie from the environment */
 function getSessionCookie(): string | undefined {
   const raw = process.env.INSTAGRAM_SESSION_ID?.trim();
   if (!raw) return undefined;
   try {
-    // DevTools often URL-encodes cookie values. Decode if needed.
     return decodeURIComponent(raw);
   } catch {
     return raw;
   }
 }
 
-/** Build request headers. Includes session cookie if configured. */
+/** Build Instagram API request headers. The full header set is required
+ *  to avoid "useragent mismatch" errors. */
 function buildHeaders(username: string): Record<string, string> {
   const headers: Record<string, string> = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "referer": `https://www.instagram.com/${encodeURIComponent(username)}/`,
+    "sec-ch-prefers-color-scheme": "dark",
+    "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="134", "Google Chrome";v="134"',
+    "sec-ch-ua-full-version-list": '"Not.A/Brand";v="8.0.0.0", "Chromium";v="134.0.6998.118", "Google Chrome";v="134.0.6998.118"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-model": '""',
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-platform-version": '"19.0.0"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": USER_AGENT,
+    "x-asbd-id": ASBD_ID,
     "x-ig-app-id": IG_APP_ID,
-    "User-Agent": USER_AGENT,
-    "Accept": "*/*",
-    "Referer": `https://www.instagram.com/${encodeURIComponent(username)}/`,
+    "x-requested-with": "XMLHttpRequest",
   };
+
   const session = getSessionCookie();
   if (session) {
-    headers["Cookie"] = `sessionid=${session}`;
+    headers["cookie"] = `sessionid=${session}`;
   }
+
   return headers;
 }
 
@@ -46,7 +61,8 @@ async function fetchWebProfileInfo(username: string) {
       return null;
     }
     if (!res.ok) {
-      console.error(`Instagram API error: ${res.status}`);
+      const text = await res.text().catch(() => "");
+      console.error(`Instagram API error ${res.status}: ${text.slice(0, 200)}`);
       return null;
     }
     return res.json();
@@ -59,14 +75,24 @@ async function fetchWebProfileInfo(username: string) {
 async function fetchGraphQL(username: string) {
   const url = `https://www.instagram.com/${encodeURIComponent(username)}/?__a=1&__d=dis`;
   const headers: Record<string, string> = {
-    "User-Agent": USER_AGENT,
-    "Accept": "*/*",
-    "Referer": "https://www.instagram.com/",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "referer": "https://www.instagram.com/",
+    "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="134", "Google Chrome";v="134"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "same-origin",
+    "upgrade-insecure-requests": "1",
+    "user-agent": USER_AGENT,
   };
+
   const session = getSessionCookie();
   if (session) {
-    headers["Cookie"] = `sessionid=${session}`;
+    headers["cookie"] = `sessionid=${session}`;
   }
+
   try {
     const res = await fetch(url, {
       headers,
@@ -86,10 +112,7 @@ async function fetchGraphQL(username: string) {
   }
 }
 
-/** Strip Instagram CDN size parameters from image URLs.
- *  When logged in, Instagram already serves the full-res URL.
- *  When anonymous, the URL may contain size params like s320x320.
- */
+/** Strip Instagram CDN size parameters from image URLs */
 function cleanInstagramUrl(url: string): string {
   try {
     const u = new URL(url);
@@ -136,6 +159,11 @@ export async function GET(request: Request) {
         is_verified: user.is_verified,
         has_session: hasSession,
       });
+    }
+
+    // If web_profile_info returned an error message, log it
+    if (info?.message) {
+      console.error("Instagram API message:", info.message);
     }
 
     const gql = await fetchGraphQL(username);
