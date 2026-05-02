@@ -2,128 +2,188 @@ export const dynamic = "force-dynamic";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
-/** Decode session cookie if URL-encoded from DevTools */
-function getSessionCookie(): string | undefined {
-  const raw = process.env.INSTAGRAM_SESSION_ID?.trim();
-  if (!raw) return undefined;
-  try { return decodeURIComponent(raw); } catch { return raw; }
-}
-
-/** Build a cookie header. Includes sessionid if configured, plus the
- *  minimal anonymous cookies that Instagram expects (same as Instaloader). */
-function buildCookieHeader(): string {
-  const session = getSessionCookie();
-  const cookies: string[] = [
-    "ig_pr=1",
-    "ig_vw=1920",
-  ];
-  if (session) {
-    cookies.push(`sessionid=${session}`);
-    cookies.push(`ds_user_id=0`);
-  } else {
-    cookies.push("sessionid=");
-    cookies.push("mid=");
-    cookies.push("csrftoken=");
-    cookies.push("ds_user_id=");
-    cookies.push("s_network=");
-  }
-  return cookies.join("; ");
-}
-
-/** Default HTTP headers modeled after Instaloader */
-function buildDefaultHeaders(): Record<string, string> {
-  return {
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "en-US,en;q=0.8",
-    "Connection": "keep-alive",
-    "Host": "www.instagram.com",
-    "Origin": "https://www.instagram.com",
-    "Referer": "https://www.instagram.com/",
-    "User-Agent": USER_AGENT,
-  };
-}
-
-/** Headers for GraphQL queries (no Connection/Content-Length) */
-function buildGraphqlHeaders(referer?: string): Record<string, string> {
-  const h = buildDefaultHeaders();
-  delete h["Connection"];
-  delete h["Host"];
-  delete h["Origin"];
-  h["authority"] = "www.instagram.com";
-  h["scheme"] = "https";
-  h["accept"] = "*/*";
-  if (referer) {
-    h["referer"] = referer;
-  }
-  h["cookie"] = buildCookieHeader();
-  return h;
-}
-
 /* ------------------------------------------------------------------ */
-/*  Doc ID GraphQL Query (POST, modeled after Instaloader)            */
+/*  Puppeteer-based profile scraper                                   */
+/*  Instagram serves higher-res images in the rendered DOM than       */
+/*  through their API endpoints.                                      */
 /* ------------------------------------------------------------------ */
 
-async function docIdGraphqlQuery(docId: string, variables: Record<string, unknown>): Promise<any> {
-  const url = "https://www.instagram.com/graphql/query";
-  const headers = buildGraphqlHeaders("https://www.instagram.com/");
-
-  const body = new URLSearchParams();
-  body.set("variables", JSON.stringify(variables));
-  body.set("doc_id", docId);
-  body.set("server_timestamps", "true");
+async function scrapeWithPuppeteer(username: string) {
+  let browser: any = null;
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        ...headers,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: body.toString(),
-      redirect: "manual",
+    const puppeteer = await import("puppeteer-core");
+
+    browser = await puppeteer.launch({
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--disable-gpu",
+        "--window-size=1280,800",
+      ],
     });
 
-    if (res.status >= 300 && res.status < 400) {
-      console.error(`GraphQL redirect ${res.status} -> ${res.headers.get("location")}`);
+    const page = await browser.newPage();
+    await page.setUserAgent(USER_AGENT);
+    await page.setViewport({ width: 1280, height: 800 });
+
+    // Block unnecessary resources to speed up loading
+    await page.setRequestInterception(true);
+    page.on("request", (req: any) => {
+      const resourceType = req.resourceType();
+      if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    const url = `https://www.instagram.com/${encodeURIComponent(username)}/`;
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
+
+    // Wait a moment for any client-side rendering
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Extract profile data from the rendered page
+    const result = await page.evaluate(() => {
+      const data: Record<string, any> = {};
+
+      // 1. Find profile picture in the DOM
+      // Instagram renders the profile pic as an <img> inside the header area
+      const imgSelectors = [
+        'img[alt*="profile picture"]',
+        'img[alt*="Profilbild"]',
+        'img[alt*="profile"]',
+        'header img',
+        'main img',
+      ];
+
+      let profileImg: HTMLImageElement | null = null;
+      for (const sel of imgSelectors) {
+        const el = document.querySelector(sel) as HTMLImageElement | null;
+        if (el && el.src && el.src.includes("cdninstagram")) {
+          profileImg = el;
+          break;
+        }
+      }
+
+      if (profileImg) {
+        data.profile_pic_url = profileImg.src;
+
+        // Check srcset for higher resolution
+        const srcset = profileImg.srcset;
+        if (srcset) {
+          const candidates = srcset
+            .split(",")
+            .map((s) => {
+              const [urlPart, sizePart] = s.trim().split(" ");
+              const width = parseInt(sizePart?.replace("w", "") || "0", 10);
+              return { url: urlPart, width };
+            })
+            .sort((a, b) => b.width - a.width);
+
+          if (candidates.length > 0) {
+            data.hd_profile_pic_url = candidates[0].url;
+          } else {
+            data.hd_profile_pic_url = profileImg.src;
+          }
+        } else {
+          data.hd_profile_pic_url = profileImg.src;
+        }
+      }
+
+      // 2. Extract username
+      const titleMatch = document.title.match(/@?([a-zA-Z0-9._]+)/);
+      data.username = titleMatch?.[1] || "";
+
+      // 3. Extract meta description for name/bio
+      const metaDesc = document.querySelector('meta[name="description"]') as HTMLMetaElement | null;
+      if (metaDesc) {
+        data.meta_description = metaDesc.content;
+      }
+
+      // 4. Look for JSON-LD or embedded data
+      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+      for (const script of scripts) {
+        try {
+          const json = JSON.parse((script as HTMLScriptElement).textContent || "{}");
+          if (json["@type"] === "ProfilePage" || json.mainEntity) {
+            const entity = json.mainEntity || json;
+            data.full_name = entity.name || "";
+            data.description = entity.description || "";
+            if (entity.image) {
+              data.profile_pic_url = entity.image;
+              data.hd_profile_pic_url = entity.image;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // 5. Fallback: search all images for the largest profile-like image
+      if (!data.hd_profile_pic_url) {
+        const allImages = Array.from(document.querySelectorAll("img"));
+        const profileLike = allImages
+          .filter((img) => {
+            const src = img.src || "";
+            return (
+              src.includes("cdninstagram") &&
+              !src.includes("avatar") &&
+              img.naturalWidth > 100
+            );
+          })
+          .sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
+
+        if (profileLike) {
+          data.profile_pic_url = profileLike.src;
+          data.hd_profile_pic_url = profileLike.src;
+        }
+      }
+
+      return data;
+    });
+
+    await browser.close();
+    browser = null;
+
+    // Validate
+    if (!result.hd_profile_pic_url) {
       return null;
     }
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(`GraphQL error ${res.status}: ${text.slice(0, 200)}`);
-      return null;
-    }
-    return res.json();
+
+    return {
+      username: result.username || username,
+      full_name: result.full_name || username,
+      biography: result.description || result.meta_description || "",
+      followers: 0,
+      following: 0,
+      posts: 0,
+      profile_pic_url: result.profile_pic_url || result.hd_profile_pic_url,
+      hd_profile_pic_url: result.hd_profile_pic_url,
+      is_private: false,
+      is_verified: false,
+      source: "puppeteer",
+    };
   } catch (err) {
-    console.error("docIdGraphqlQuery error:", err);
+    console.error("Puppeteer error:", err);
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        // ignore
+      }
+    }
     return null;
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Profile fetch via search Doc ID (Instaloader approach)            */
-/* ------------------------------------------------------------------ */
-
-async function fetchProfileBySearch(username: string) {
-  const data = await docIdGraphqlQuery("26347858941511777", {
-    hasQuery: true,
-    query: username,
-  });
-
-  if (!data?.data) return null;
-
-  const users = data.data.xdt_api__v1__fbsearch__non_profiled_serp?.users;
-  if (!Array.isArray(users)) return null;
-
-  for (const user of users) {
-    if (user.username?.toLowerCase() === username.toLowerCase()) {
-      return normalizeUser(user);
-    }
-  }
-  return null;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Fallback: web_profile_info API endpoint                           */
+/*  Fallback: HTTP API                                                */
 /* ------------------------------------------------------------------ */
 
 async function fetchWebProfileInfo(username: string) {
@@ -142,7 +202,6 @@ async function fetchWebProfileInfo(username: string) {
     "x-asbd-id": "129477",
     "x-ig-app-id": "936619743392459",
     "x-requested-with": "XMLHttpRequest",
-    "cookie": buildCookieHeader(),
   };
 
   try {
@@ -159,24 +218,7 @@ async function fetchWebProfileInfo(username: string) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Normalization helpers                                             */
-/* ------------------------------------------------------------------ */
-
-interface NormalizedUser {
-  username: string;
-  full_name: string;
-  biography: string;
-  followers: number;
-  following: number;
-  posts: number;
-  profile_pic_url: string;
-  hd_profile_pic_url: string;
-  is_private: boolean;
-  is_verified: boolean;
-}
-
-function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
+function normalizeUser(raw: Record<string, unknown>) {
   const username = String(raw.username || "");
   if (!username) return null;
 
@@ -186,11 +228,6 @@ function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
     return 0;
   };
 
-  const edgeFollowedBy = (raw.edge_followed_by as Record<string, unknown>)?.count;
-  const edgeFollow = (raw.edge_follow as Record<string, unknown>)?.count;
-  const edgeMedia = (raw.edge_owner_to_timeline_media as Record<string, unknown>)?.count;
-
-  // Try hd_profile_pic_url_info first (highest res when logged in)
   const hdInfo = (raw.hd_profile_pic_url_info as Record<string, unknown>)?.url;
   const hdFallback = raw.profile_pic_url_hd || raw.profile_pic_url;
 
@@ -198,32 +235,14 @@ function normalizeUser(raw: Record<string, unknown>): NormalizedUser | null {
     username,
     full_name: String(raw.full_name || username),
     biography: String(raw.biography || ""),
-    followers: getNum(edgeFollowedBy ?? raw.follower_count),
-    following: getNum(edgeFollow ?? raw.following_count),
-    posts: getNum(edgeMedia ?? raw.media_count),
+    followers: getNum((raw.edge_followed_by as Record<string, unknown>)?.count ?? raw.follower_count),
+    following: getNum((raw.edge_follow as Record<string, unknown>)?.count ?? raw.following_count),
+    posts: getNum((raw.edge_owner_to_timeline_media as Record<string, unknown>)?.count ?? raw.media_count),
     profile_pic_url: String(raw.profile_pic_url || ""),
     hd_profile_pic_url: String(hdInfo || hdFallback || raw.profile_pic_url || ""),
     is_private: Boolean(raw.is_private),
     is_verified: Boolean(raw.is_verified),
   };
-}
-
-/** Strip Instagram CDN size parameters, especially the stp=dst-jpg_s... param
- *  that forces a low-res thumbnail. */
-function cleanUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    // Remove the 'stp' param entirely — it forces a specific size like s320x320
-    u.searchParams.delete("stp");
-    // Also remove explicit size params
-    u.searchParams.delete("s");
-    u.searchParams.delete("w");
-    u.searchParams.delete("h");
-    u.searchParams.delete("c");
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,31 +261,20 @@ export async function GET(request: Request) {
     return Response.json({ error: "Invalid username format" }, { status: 400 });
   }
 
-  const hasSession = !!getSessionCookie();
-
   try {
-    // Strategy 1: Doc ID GraphQL search (Instaloader approach)
-    const user = await fetchProfileBySearch(username);
-    if (user) {
-      return Response.json({
-        ...user,
-        profile_pic_url: cleanUrl(user.profile_pic_url),
-        hd_profile_pic_url: cleanUrl(user.hd_profile_pic_url),
-        has_session: hasSession,
-        source: "doc_id_search",
-      });
+    // Strategy 1: Puppeteer (renders the page like a real browser)
+    const puppeteerResult = await scrapeWithPuppeteer(username);
+    if (puppeteerResult) {
+      return Response.json(puppeteerResult);
     }
 
-    // Strategy 2: web_profile_info API fallback
+    // Strategy 2: API fallback
     const info = await fetchWebProfileInfo(username);
     if (info?.data?.user) {
       const u = normalizeUser(info.data.user as Record<string, unknown>);
       if (u) {
         return Response.json({
           ...u,
-          profile_pic_url: cleanUrl(u.profile_pic_url),
-          hd_profile_pic_url: cleanUrl(u.hd_profile_pic_url),
-          has_session: hasSession,
           source: "web_profile_info",
         });
       }
