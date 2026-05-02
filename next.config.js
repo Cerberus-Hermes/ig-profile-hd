@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",
+  // Nixpacks: kein standalone nötig, npm start served alles korrekt
 };
 
 module.exports = nextConfig;
