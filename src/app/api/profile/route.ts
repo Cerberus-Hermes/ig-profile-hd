@@ -3,9 +3,97 @@ export const dynamic = "force-dynamic";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
 /* ------------------------------------------------------------------ */
+/*  Cookie helpers (inspired by Instagram-Profile-Downloader)         */
+/* ------------------------------------------------------------------ */
+
+interface CookieDef {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: string;
+  sameParty?: boolean;
+  sourceScheme?: string;
+  sourcePort?: number;
+  partitionKey?: string;
+}
+
+function normalizeCookies(raw: unknown[]): CookieDef[] {
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .filter((c): c is Record<string, unknown> => c !== null && typeof c === "object")
+    .map((cookie) => {
+      const normalized: CookieDef = {
+        name: String(cookie.name || ""),
+        value: String(cookie.value || ""),
+        domain: cookie.domain ? String(cookie.domain) : ".instagram.com",
+        path: cookie.path ? String(cookie.path) : "/",
+        expires: typeof cookie.expirationDate === "number" ? cookie.expirationDate : -1,
+        httpOnly: Boolean(cookie.httpOnly),
+        secure: Boolean(cookie.secure),
+      };
+
+      // Fix sameSite value - Puppeteer only accepts 'Strict', 'Lax', or 'None'
+      if (cookie.sameSite) {
+        const sameSite = String(cookie.sameSite).toLowerCase();
+        if (sameSite === "no_restriction" || sameSite === "none") {
+          normalized.sameSite = "None";
+        } else if (sameSite === "lax") {
+          normalized.sameSite = "Lax";
+        } else if (sameSite === "strict") {
+          normalized.sameSite = "Strict";
+        } else {
+          normalized.sameSite = "Lax";
+        }
+      }
+
+      return normalized;
+    })
+    .filter((c) => c.name && c.value);
+}
+
+function loadCookies(): CookieDef[] {
+  // 1. Try INSTAGRAM_COOKIES_JSON (full cookie array)
+  const cookiesJson = process.env.INSTAGRAM_COOKIES_JSON?.trim();
+  if (cookiesJson) {
+    try {
+      const parsed = JSON.parse(cookiesJson);
+      const normalized = normalizeCookies(parsed);
+      if (normalized.length > 0) {
+        console.log(`Loaded ${normalized.length} cookies from INSTAGRAM_COOKIES_JSON`);
+        return normalized;
+      }
+    } catch (e) {
+      console.error("Failed to parse INSTAGRAM_COOKIES_JSON:", e);
+    }
+  }
+
+  // 2. Fallback: INSTAGRAM_SESSION_ID (single cookie)
+  const sessionId = process.env.INSTAGRAM_SESSION_ID?.trim();
+  if (sessionId) {
+    console.log("Using INSTAGRAM_SESSION_ID as single cookie");
+    return [
+      {
+        name: "sessionid",
+        value: sessionId,
+        domain: ".instagram.com",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "Lax",
+      },
+    ];
+  }
+
+  return [];
+}
+
+/* ------------------------------------------------------------------ */
 /*  Puppeteer-based profile scraper                                   */
-/*  Instagram serves higher-res images in the rendered DOM than       */
-/*  through their API endpoints.                                      */
 /* ------------------------------------------------------------------ */
 
 async function scrapeWithPuppeteer(username: string) {
@@ -31,22 +119,11 @@ async function scrapeWithPuppeteer(username: string) {
     await page.setUserAgent(USER_AGENT);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Inject Instagram cookies if available
-    const sessionId = process.env.INSTAGRAM_SESSION_ID?.trim();
-    if (sessionId) {
-      const cookies = [
-        {
-          name: "sessionid",
-          value: sessionId,
-          domain: ".instagram.com",
-          path: "/",
-          httpOnly: true,
-          secure: true,
-          sameSite: "Lax" as const,
-        },
-      ];
+    // Inject cookies
+    const cookies = loadCookies();
+    if (cookies.length > 0) {
       await page.setCookie(...cookies);
-      console.log("Injected Instagram session cookie into Puppeteer");
+      console.log(`Injected ${cookies.length} Instagram cookies into Puppeteer`);
     }
 
     // Block only non-essential resources; keep images so src/srcset populate
@@ -66,12 +143,20 @@ async function scrapeWithPuppeteer(username: string) {
     // Wait a moment for any client-side rendering
     await new Promise((r) => setTimeout(r, 1500));
 
+    // Check if we're logged in (login wall detection)
+    const isLoggedIn = await page.evaluate(() => {
+      return !document.querySelector('input[name="username"]');
+    });
+
+    if (!isLoggedIn && cookies.length > 0) {
+      console.log("Instagram shows login wall despite cookies - cookies may be expired or IP-restricted");
+    }
+
     // Extract profile data from the rendered page
     const result = await page.evaluate(() => {
       const data: Record<string, any> = {};
 
       // 1. Find profile picture in the DOM
-      // Instagram renders the profile pic as an <img> inside the header area
       const imgSelectors = [
         'img[alt*="profile picture"]',
         'img[alt*="Profilbild"]',
@@ -124,13 +209,13 @@ async function scrapeWithPuppeteer(username: string) {
       const titleMatch = document.title.match(/@?([a-zA-Z0-9._]+)/);
       data.username = titleMatch?.[1] || "";
 
-      // 3. Extract meta description for name/bio
+      // 4. Extract meta description for name/bio
       const metaDesc = document.querySelector('meta[name="description"]') as HTMLMetaElement | null;
       if (metaDesc) {
         data.meta_description = metaDesc.content;
       }
 
-      // 4. Look for JSON-LD or embedded data
+      // 5. Look for JSON-LD or embedded data
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
       for (const script of scripts) {
         try {
@@ -149,7 +234,7 @@ async function scrapeWithPuppeteer(username: string) {
         }
       }
 
-      // 5. Fallback: search all images for the largest profile-like image
+      // 6. Fallback: search all images for the largest profile-like image
       if (!data.hd_profile_pic_url) {
         const allImages = Array.from(document.querySelectorAll("img"));
         const profileLike = allImages
@@ -197,6 +282,7 @@ async function scrapeWithPuppeteer(username: string) {
       is_private: false,
       is_verified: false,
       source: "puppeteer",
+      is_logged_in: isLoggedIn,
     };
   } catch (err) {
     console.error("Puppeteer error:", err);
